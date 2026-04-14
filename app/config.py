@@ -24,6 +24,9 @@ class Config:
     # 录入权限白名单（open_id，逗号分隔）
     ADMIN_OPEN_IDS = os.getenv("ADMIN_OPEN_IDS", "")
 
+    # 小米反馈平台
+    XIAOMI_FEEDBACK_COOKIE = os.getenv("XIAOMI_FEEDBACK_COOKIE", "")
+
     # 兜底模型 (本地 Ollama)
     FALLBACK_LLM_API_BASE = os.getenv("FALLBACK_LLM_API_BASE", "http://localhost:11434/v1")
     FALLBACK_LLM_API_KEY = os.getenv("FALLBACK_LLM_API_KEY", "ollama")

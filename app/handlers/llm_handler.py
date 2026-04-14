@@ -91,6 +91,148 @@ async def process_text_message(message_id: str, text: str, sender_id: str = ""):
         log_chat(sender_id, text, reply_text, "删除")
         return
 
+    # ── 反馈查询 ──
+    if intent == "feedback":
+        from app.services.feedback import search_feedback
+        from datetime import datetime, timedelta
+
+        fb_keyword = fields.get("feedback_keyword", "")
+        fb_days = int(fields.get("feedback_days", 3) or 3)
+        if not fb_keyword:
+            reply_text = "⚠️ 请告诉我要查询什么关键词的反馈，比如：查一下超级岛的用户反馈"
+            _reply(message_id, reply_text)
+            log_chat(sender_id, text, reply_text, "反馈查询-无关键词")
+            return
+
+        _reply(message_id, f"🔍 正在查询近 {fb_days} 天「{fb_keyword}」的用户反馈，分析中请稍候...")
+
+        end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        begin_time = (datetime.now() - timedelta(days=fb_days)).strftime("%Y-%m-%d %H:%M:%S")
+        result = search_feedback(fb_keyword, begin_time, end_time, page=1, page_size=100)
+
+        if result.get("error"):
+            reply_text = f"❌ 查询失败：{result['error']}"
+            _reply(message_id, reply_text)
+            log_chat(sender_id, text, reply_text, "反馈查询失败")
+            return
+
+        total = result["total"]
+        items = result["items"]
+
+        if total == 0:
+            reply_text = f"📭 近 {fb_days} 天没有找到「{fb_keyword}」相关的用户反馈。"
+            _reply(message_id, reply_text)
+            log_chat(sender_id, text, reply_text, "反馈查询")
+            return
+
+        # 用 LLM 对反馈做分类汇总
+        feedback_texts = []
+        for item in items:
+            content = item.get("content", "")
+            if len(content) > 150:
+                content = content[:150]
+            feedback_texts.append(content)
+
+        summary = await llm_service.summarize_feedback(fb_keyword, total, feedback_texts)
+
+        if summary and summary.get("categories"):
+            categories = summary["categories"]
+
+            def _build_row(idx, cat, bg):
+                return {
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "background_style": bg,
+                    "columns": [
+                        {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content": f"{idx}"}]},
+                        {"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content": cat["name"]}]},
+                        {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content": str(cat["count"])}]},
+                        {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content": cat["percent"]}]},
+                        {"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content": cat["reason"]}]},
+                    ]
+                }
+
+            header_row = {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "grey",
+                "columns": [
+                    {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": "**#**"}]},
+                    {"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": "**问题分类**"}]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": "**数量**"}]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": "**占比**"}]},
+                    {"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": "**主要原因**"}]},
+                ]
+            }
+
+            top10 = categories[:10]
+            rest = categories[10:]
+
+            top_rows = []
+            for idx, cat in enumerate(top10, 1):
+                bg = "grey" if idx % 2 == 0 else "default"
+                top_rows.append(_build_row(idx, cat, bg))
+
+            elements = [header_row, {"tag": "hr"}] + top_rows
+
+            if rest:
+                rest_rows = []
+                for idx, cat in enumerate(rest, 11):
+                    bg = "grey" if idx % 2 == 0 else "default"
+                    rest_rows.append(_build_row(idx, cat, bg))
+                elements.append({"tag": "hr"})
+                elements.append({
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": f"📋 查看更多分类（还有 {len(rest)} 项）"
+                        }
+                    },
+                    "vertical_spacing": "8px",
+                    "elements": rest_rows
+                })
+
+            card = {
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"📊「{fb_keyword}」反馈汇总（{begin_time[:10]} ~ {end_time[:10]}，共 {total} 条）"},
+                    "template": "blue",
+                },
+                "elements": elements
+            }
+
+            # 用卡片回复
+            body = ReplyMessageRequestBody.builder() \
+                .content(json.dumps(card)) \
+                .msg_type("interactive") \
+                .build()
+            req = ReplyMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(body) \
+                .build()
+            try:
+                feishu_client.im.v1.message.reply(req)
+            except Exception as e:
+                print(f"回复卡片失败: {e}")
+                _reply(message_id, f"📊 近 {fb_days} 天「{fb_keyword}」共 {total} 条反馈，卡片发送失败。")
+        else:
+            reply_text = f"📊 近 {fb_days} 天「{fb_keyword}」共 {total} 条反馈，分类汇总生成失败，请稍后重试。"
+            _reply(message_id, reply_text)
+
+        log_chat(sender_id, text, f"反馈汇总-{total}条", "反馈查询")
+        return
+
     # ── 查询 ──
     if intent == "query":
         app_name = fields.get("app_name", "")
